@@ -14,4 +14,6 @@ urlpatterns = [
     path('logout/', LogoutView.as_view(), name='logout'),
     path('historical/data',
          download_csv_data, name='historical-data'),
+    path('api/station-summary/',
+         station_summary, name='station-summary'),
 ]

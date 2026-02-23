@@ -770,3 +770,107 @@ Filtro para formatear datos en los templates
 @register.filter
 def add_str(str1, str2):
     return str1 + str2
+
+
+"""
+Endpoint: /api/station-summary/
+Consulta que devuelve un resumen de actividad por estación.
+Para un rango de tiempo, retorna por cada estación:
+- Información del usuario
+- Ubicación geográfica (ciudad, estado, país, lat, lng)
+- Estadísticas por variable de medición (min, max, avg, count, último valor)
+
+Nota: En TimescaleDB, los datos están agrupados por hora con arrays de valores
+y estadísticas pre-calculadas (min_value, max_value, avg_value, length).
+Se usan esos campos pre-calculados para obtener las estadísticas agregadas
+en lugar de recalcular desde valores individuales.
+"""
+
+
+def station_summary(request):
+    from_param = request.GET.get('from', None)
+    to_param = request.GET.get('to', None)
+    try:
+        start = datetime.strptime(from_param, '%Y%m%d') if from_param else datetime.now() - dateutil.relativedelta.relativedelta(weeks=1)
+    except ValueError:
+        return JsonResponse({'error': 'Formato de fecha inválido. Use yyyymmdd, ejemplo: 20210601'}, status=400)
+    try:
+        end = datetime.strptime(to_param, '%Y%m%d') if to_param else datetime.now() + dateutil.relativedelta.relativedelta(days=1)
+    except ValueError:
+        return JsonResponse({'error': 'Formato de fecha inválido. Use yyyymmdd, ejemplo: 20210601'}, status=400)
+
+    start_ts = int(start.timestamp() * 1000000)
+    end_ts = int(end.timestamp() * 1000000)
+
+    stations = Station.objects.select_related(
+        'user', 'location', 'location__city', 'location__state', 'location__country'
+    ).all()
+
+    measurements = Measurement.objects.all()
+    result = []
+
+    for station in stations:
+        station_data = {
+            'station_id': station.id,
+            'user': station.user.login,
+            'location': {
+                'city': station.location.city.name,
+                'state': station.location.state.name,
+                'country': station.location.country.name,
+                'lat': float(station.location.lat) if station.location.lat else None,
+                'lng': float(station.location.lng) if station.location.lng else None,
+            },
+            'last_activity': station.last_activity.isoformat() if station.last_activity else None,
+            'measurements': [],
+        }
+
+        for measure in measurements:
+            data_qs = Data.objects.filter(
+                station=station,
+                measurement=measure,
+                time__gte=start_ts,
+                time__lte=end_ts,
+            )
+            chunks = list(data_qs)
+            if not chunks:
+                continue
+
+            # Estadísticas pre-calculadas desde los chunks de TimescaleDB
+            overall_min = min(c.min_value for c in chunks if c.min_value is not None)
+            overall_max = max(c.max_value for c in chunks if c.max_value is not None)
+            total_length = sum(c.length for c in chunks)
+            overall_avg = (
+                sum(c.avg_value * c.length for c in chunks if c.avg_value is not None) / total_length
+                if total_length > 0 else 0
+            )
+
+            # Último valor: del chunk más reciente, el último elemento del array
+            last_chunk = max(chunks, key=lambda c: c.time)
+            last_value = last_chunk.values[-1] if last_chunk.values else None
+            last_time_offset = last_chunk.times[-1] if last_chunk.times else 0
+            last_time_epoch = last_chunk.base_time.timestamp() + last_time_offset
+            last_time_str = datetime.fromtimestamp(last_time_epoch).isoformat()
+
+            station_data['measurements'].append({
+                'name': measure.name,
+                'unit': measure.unit,
+                'count': total_length,
+                'min': overall_min,
+                'max': overall_max,
+                'avg': round(overall_avg, 2),
+                'last_value': last_value,
+                'last_time': last_time_str,
+            })
+
+        if station_data['measurements']:
+            result.append(station_data)
+
+    response = {
+        'stations': result,
+        'total_stations': len(result),
+        'time_range': {
+            'from': start.strftime('%d/%m/%Y %H:%M'),
+            'to': end.strftime('%d/%m/%Y %H:%M'),
+        },
+    }
+    return JsonResponse(response)

@@ -673,3 +673,90 @@ Filtro para formatear datos en los templates
 @ register.filter
 def add_str(str1, str2):
     return str1 + str2
+
+
+'''
+Endpoint: /api/station-summary/
+Consulta que devuelve un resumen de actividad por estación.
+Para un rango de tiempo, retorna por cada estación:
+- Información del usuario
+- Ubicación geográfica (ciudad, estado, país, lat, lng)
+- Estadísticas por variable de medición (min, max, avg, count, último valor)
+'''
+
+
+def station_summary(request):
+    from_param = request.GET.get('from', None)
+    to_param = request.GET.get('to', None)
+    try:
+        start = datetime.strptime(from_param, '%Y%m%d') if from_param else datetime.now() - dateutil.relativedelta.relativedelta(weeks=1)
+    except ValueError:
+        return JsonResponse({'error': 'Formato de fecha inválido. Use yyyymmdd, ejemplo: 20210601'}, status=400)
+    try:
+        end = datetime.strptime(to_param, '%Y%m%d') if to_param else datetime.now() + dateutil.relativedelta.relativedelta(days=1)
+    except ValueError:
+        return JsonResponse({'error': 'Formato de fecha inválido. Use yyyymmdd, ejemplo: 20210601'}, status=400)
+
+    stations = Station.objects.select_related(
+        'user', 'location', 'location__city', 'location__state', 'location__country'
+    ).all()
+
+    measurements = Measurement.objects.all()
+    result = []
+
+    for station in stations:
+        station_data = {
+            'station_id': station.id,
+            'user': station.user.login,
+            'location': {
+                'city': station.location.city.name,
+                'state': station.location.state.name,
+                'country': station.location.country.name,
+                'lat': float(station.location.lat) if station.location.lat else None,
+                'lng': float(station.location.lng) if station.location.lng else None,
+            },
+            'last_activity': station.last_activity.isoformat() if station.last_activity else None,
+            'measurements': [],
+        }
+
+        for measure in measurements:
+            data_qs = Data.objects.filter(
+                station=station,
+                measurement=measure,
+                time__gte=start,
+                time__lte=end,
+            )
+            count = data_qs.count()
+            if count == 0:
+                continue
+
+            stats = data_qs.aggregate(
+                min_val=Min('value'),
+                max_val=Max('value'),
+                avg_val=Avg('value'),
+            )
+            last_record = data_qs.order_by('-time').first()
+
+            station_data['measurements'].append({
+                'name': measure.name,
+                'unit': measure.unit,
+                'count': count,
+                'min': stats['min_val'],
+                'max': stats['max_val'],
+                'avg': round(stats['avg_val'], 2) if stats['avg_val'] else 0,
+                'last_value': last_record.value if last_record else None,
+                'last_time': last_record.time.isoformat() if last_record else None,
+            })
+
+        if station_data['measurements']:
+            result.append(station_data)
+
+    response = {
+        'stations': result,
+        'total_stations': len(result),
+        'time_range': {
+            'from': start.strftime('%d/%m/%Y %H:%M'),
+            'to': end.strftime('%d/%m/%Y %H:%M'),
+        },
+    }
+    return JsonResponse(response)
